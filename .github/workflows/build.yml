@@ -1,0 +1,66 @@
+name: Build Nova V5 privately on macOS
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full commit SHA on the private Nova V5 branch
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Check out the private Nova V5 branch
+        uses: actions/checkout@v4
+        with:
+          repository: BamBoo264/Mugoat-Ios
+          ref: nova-native-runtime-v5-online
+          ssh-key: ${{ secrets.NOVA_SOURCE_SSH_KEY }}
+          persist-credentials: false
+      - name: Verify checkout and prepare toolchain
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          AGE_RECIPIENT: ${{ vars.NOVA_ARTIFACT_RECIPIENT }}
+        run: |
+          test "$(uname -m)" = arm64
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          [[ "$AGE_RECIPIENT" == ssh-ed25519\ * ]]
+          brew install xcodegen age
+      - name: Compile and package Nova
+        env:
+          JOBS: '3'
+        run: |
+          export PGMSL_PREBUILT_URL="file://$PWD/build-tools/pgmsl-macos-arm64.tar.gz"
+          {
+            xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
+            python3 tools/test_nova_integrity.py
+            python3 tools/test_nova_online.py
+            xcrun swiftc -typecheck -parse-as-library -target arm64-apple-ios15.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" -import-objc-header app/Source/Native-Bridging-Header.h -I app/Source -I app/App/GameInstaller app/App/*.swift app/App/GameInstaller/*.swift
+            python3 app/Scripts/assemble_inputs.py --inputs . --out "$RUNNER_TEMP/game-files"
+            bash build_ipa.sh --mirror "$RUNNER_TEMP/game-files"
+            python3 tools/package_variants.py
+          } >"$RUNNER_TEMP/nova-build.log" 2>&1
+      - name: Encrypt build output and diagnostics
+        if: ${{ always() }}
+        env:
+          AGE_RECIPIENT: ${{ vars.NOVA_ARTIFACT_RECIPIENT }}
+        run: |
+          [[ "$AGE_RECIPIENT" == ssh-ed25519\ * ]]
+          mkdir -p "$RUNNER_TEMP/encrypted"
+          if [[ -f Mugoat-Nova-NativeRuntime-V5-Online.ipa ]]; then
+            age -r "$AGE_RECIPIENT" -o "$RUNNER_TEMP/encrypted/Nova-V5.ipa.age" Mugoat-Nova-NativeRuntime-V5-Online.ipa
+          fi
+          if [[ -f "$RUNNER_TEMP/nova-build.log" ]]; then
+            age -r "$AGE_RECIPIENT" -o "$RUNNER_TEMP/encrypted/nova-build.log.age" "$RUNNER_TEMP/nova-build.log"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: Nova-V5-encrypted
+          path: ${{ runner.temp }}/encrypted/*.age
+          if-no-files-found: ignore
+          retention-days: 3
